@@ -2,15 +2,14 @@ name = "callhome"
 compatibility_date = "2024-09-02"
 pages_build_output_dir = "public"
 
-# KV namespace for storing encrypted contacts + rate limit counters
-# Create with: wrangler kv namespace create CONTACTS
-# Then replace the id values below
-[[kv_namespaces]]
-binding = "CONTACTS"
-id = "YOUR_KV_NAMESPACE_ID"
-preview_id = "YOUR_PREVIEW_KV_NAMESPACE_ID"
+# Cloudflare D1 — relational SQLite database
+# Create with: wrangler d1 create callhome-db
+# Then replace the database_id value below
+[[d1_databases]]
+binding      = "DB"
+database_name = "callhome-db"
+database_id  = "YOUR_D1_DATABASE_ID"
 
 [vars]
-# Global rate limits
 RATE_LIMIT_CREATE_PER_HOUR = "5"
 RATE_LIMIT_READ_PER_MINUTE = "30"
