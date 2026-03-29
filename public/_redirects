@@ -1,0 +1,3 @@
+# Cloudflare Pages SPA routing
+# Pages Functions (/api/*) take priority over this rule automatically
+/*    /index.html    200
