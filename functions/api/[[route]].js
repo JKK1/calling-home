@@ -1,10 +1,10 @@
 // Cloudflare Pages Function — handles all /api/* routes
 // Uses Cloudflare D1 (SQLite) for storage.
 //
-// Global daily limit: MAX_PAGES_PER_DAY (default 1000).
+// Global rolling limit: MAX_PAGES_PER_DAY (default 1000) pages per 24 hours.
+// Measured directly from the contacts table — no separate counter.
 // When exceeded, requests are queued. The queue is drained automatically
-// at the start of each UTC day by the first create request that arrives —
-// no external cron or scheduler needed.
+// at the top of every create request as the window rolls forward.
 
 const RESERVED_SLUGS = new Set([
   'api', 'admin', 'www', 'mail', 'ftp', 'static', 'assets',
@@ -28,32 +28,29 @@ function err(message, status = 400) {
   return json({ error: message }, status);
 }
 
-function utcDayBucket() {
-  const d = new Date();
-  return d.getUTCFullYear() * 10000 + (d.getUTCMonth() + 1) * 100 + d.getUTCDate();
+// ── Rolling 24h window ────────────────────────────────────────────────────────
+// Counts pages created in the last 24 hours directly from the contacts table.
+
+async function getRollingCapacity(db, env) {
+  const limit = parseInt(env.MAX_PAGES_PER_DAY ?? '1000');
+  const row   = await db.prepare(
+    "SELECT COUNT(*) as n FROM contacts WHERE created_at > datetime('now', '-1 day')"
+  ).first();
+  const used = row?.n ?? 0;
+  return { used, limit, capacity: Math.max(0, limit - used) };
 }
 
 // ── Queue drain ───────────────────────────────────────────────────────────────
-// Called at the top of every create request.
-// Promotes queued entries from previous days FIFO up to today's remaining capacity.
-// Fully self-contained — no external cron needed.
+// Promotes queued entries FIFO up to the current rolling capacity.
+// Called at the top of every create request — no external cron needed.
 
 async function drainQueue(db, env) {
-  const limit  = parseInt(env.MAX_PAGES_PER_DAY ?? '1000');
-  const today  = utcDayBucket();
-  const key    = `global:pages:${today}`;
-
-  const usedRow  = await db.prepare('SELECT count FROM rate_limits WHERE key = ?').bind(key).first();
-  const used     = usedRow?.count ?? 0;
-  const capacity = Math.max(0, limit - used);
+  const { capacity } = await getRollingCapacity(db, env);
   if (capacity === 0) return;
 
-  const entries = await db.prepare(`
-    SELECT slug, salt, iv, data, verifier FROM queue
-    WHERE day_bucket < ?
-    ORDER BY day_bucket ASC, position ASC
-    LIMIT ?
-  `).bind(today, capacity).all();
+  const entries = await db.prepare(
+    'SELECT slug, salt, iv, data, verifier FROM queue ORDER BY queued_at ASC LIMIT ?'
+  ).bind(capacity).all();
 
   if (!entries.results?.length) return;
 
@@ -70,33 +67,15 @@ async function drainQueue(db, env) {
   }
 }
 
-// ── Global daily limit ────────────────────────────────────────────────────────
-
-async function checkGlobalDailyLimit(db, env) {
-  const limit = parseInt(env.MAX_PAGES_PER_DAY ?? '1000');
-  const key   = `global:pages:${utcDayBucket()}`;
-
-  await db.prepare(`
-    INSERT INTO rate_limits (key, count, window_start)
-    VALUES (?, 1, ?)
-    ON CONFLICT(key) DO UPDATE SET count = count + 1
-  `).bind(key, Math.floor(Date.now() / 1000)).run();
-
-  const row = await db.prepare('SELECT count FROM rate_limits WHERE key = ?').bind(key).first();
-  const count = row?.count ?? 1;
-  return { allowed: count <= limit, count, limit };
-}
-
 // ── Per-IP rate limiting ──────────────────────────────────────────────────────
 
 async function checkRateLimit(db, type, ip, env) {
   const createLimit = parseInt(env.RATE_LIMIT_CREATE_PER_HOUR ?? '5');
   const readLimit   = parseInt(env.RATE_LIMIT_READ_PER_MINUTE ?? '30');
-
-  const windowSecs = type === 'create' ? 3600 : 60;
-  const limit      = type === 'create' ? createLimit : readLimit;
-  const bucket     = Math.floor(Date.now() / (windowSecs * 1000));
-  const key        = `${type}:${ip}:${bucket}`;
+  const windowSecs  = type === 'create' ? 3600 : 60;
+  const limit       = type === 'create' ? createLimit : readLimit;
+  const bucket      = Math.floor(Date.now() / (windowSecs * 1000));
+  const key         = `${type}:${ip}:${bucket}`;
 
   await db.prepare(`
     INSERT INTO rate_limits (key, count, window_start)
@@ -121,19 +100,6 @@ function safeCompare(a, b) {
   return diff === 0;
 }
 
-// ── Enqueue ───────────────────────────────────────────────────────────────────
-
-async function enqueue(db, slug, salt, iv, data, verifier) {
-  const day = utcDayBucket();
-  const pos = await db.prepare('SELECT COUNT(*) as n FROM queue WHERE day_bucket = ?').bind(day).first();
-  const position = (pos?.n ?? 0) + 1;
-  await db.prepare(`
-    INSERT INTO queue (slug, salt, iv, data, verifier, day_bucket, position, queued_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(slug, salt, iv, data, verifier, day, position, new Date().toISOString()).run();
-  return position;
-}
-
 // ── Route handlers ────────────────────────────────────────────────────────────
 
 async function handleCheckSlug(db, slug) {
@@ -147,12 +113,28 @@ async function handleCheckSlug(db, slug) {
   return json({ available: !inContacts && !inQueue });
 }
 
+async function handleQueueStatus(db, slug) {
+  // Promoted — page is live
+  const live = await db.prepare('SELECT slug FROM contacts WHERE slug = ?').bind(slug).first();
+  if (live) return json({ status: 'ready' });
+
+  // Still in queue — return current position
+  const entry = await db.prepare('SELECT queued_at FROM queue WHERE slug = ?').bind(slug).first();
+  if (!entry) return err('Not found.', 404);
+
+  const pos = await db.prepare(
+    'SELECT COUNT(*) as n FROM queue WHERE queued_at <= ?'
+  ).bind(entry.queued_at).first();
+
+  return json({ status: 'queued', position: pos?.n ?? 1 });
+}
+
 async function handleCreate(request, db, ip, env) {
   if (!await checkRateLimit(db, 'create', ip, env)) {
     return err('Too many pages created from your IP. Try again in an hour.', 429);
   }
 
-  // Drain any queued entries from previous days before processing this request
+  // Drain queue first — rolling window may have freed capacity since last request
   await drainQueue(db, env);
 
   let body;
@@ -172,10 +154,16 @@ async function handleCreate(request, db, ip, env) {
   const queued = await db.prepare('SELECT slug FROM queue WHERE slug = ?').bind(normalized).first();
   if (queued) return err('That URL is already in the queue.', 409);
 
-  const { allowed } = await checkGlobalDailyLimit(db, env);
+  const { capacity } = await getRollingCapacity(db, env);
 
-  if (!allowed) {
-    const position = await enqueue(db, normalized, salt, iv, data, verifier);
+  if (capacity === 0) {
+    // Queue it — calculate FIFO position
+    const pos = await db.prepare('SELECT COUNT(*) as n FROM queue').first();
+    const position = (pos?.n ?? 0) + 1;
+    await db.prepare(`
+      INSERT INTO queue (slug, salt, iv, data, verifier, queued_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).bind(normalized, salt, iv, data, verifier, new Date().toISOString()).run();
     return json({ queued: true, slug: normalized, position }, 202);
   }
 
@@ -192,11 +180,9 @@ async function handleRead(request, db, ip, env, slug) {
   if (!await checkRateLimit(db, 'read', ip, env)) {
     return err('Too many requests. Try again in a minute.', 429);
   }
-
   const row = await db.prepare(
     'SELECT salt, iv, data, updated_at FROM contacts WHERE slug = ?'
   ).bind(slug).first();
-
   if (!row) return err('Page not found.', 404);
   return json({ salt: row.salt, iv: row.iv, data: row.data, updatedAt: row.updated_at });
 }
@@ -205,7 +191,6 @@ async function handleUpdate(request, db, ip, env, slug) {
   if (!await checkRateLimit(db, 'create', ip, env)) {
     return err('Too many requests from your IP. Try again in an hour.', 429);
   }
-
   const row = await db.prepare('SELECT verifier FROM contacts WHERE slug = ?').bind(slug).first();
   if (!row) return err('Page not found.', 404);
 
@@ -253,7 +238,8 @@ export async function onRequest(context) {
     ? params.route
     : (params.route ?? '').split('/').filter(Boolean);
 
-  if (route[0] !== 'contacts') return new Response('Not found', { status: 404 });
+  if (route[0] === 'queue' && route[1]) return handleQueueStatus(db, route[1].toLowerCase());
+  if (route[0] !== 'contacts')          return new Response('Not found', { status: 404 });
 
   const slug = route[1]?.toLowerCase() ?? null;
 
