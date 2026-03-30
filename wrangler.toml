@@ -7,8 +7,8 @@ pages_build_output_dir = "public"
 # Then replace the database_id value below
 [[d1_databases]]
 binding      = "DB"
-database_name = "callhome-db"
-database_id  = "b0cdbe84-6cd1-4ec1-8ea3-7a645c1dd812"
+database_name = "calling-home-db"
+database_id  = "e60b50b5-2522-4190-a09c-cdf95b350052"
 
 
 [vars]
