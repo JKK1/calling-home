@@ -8,7 +8,7 @@ pages_build_output_dir = "public"
 [[d1_databases]]
 binding      = "DB"
 database_name = "callhome-db"
-database_id  = "YOUR_D1_DATABASE_ID"
+database_id  = "b0cdbe84-6cd1-4ec1-8ea3-7a645c1dd812"
 
 [vars]
 RATE_LIMIT_CREATE_PER_HOUR = "5"
