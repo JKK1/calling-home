@@ -9,7 +9,7 @@ pages_build_output_dir = "public"
 
 binding      = "DB"
 database_name = "calling-home-db"
-database_id  = "9eeacf28-0547-471d-8724-30c682b68111"
+database_id  = "4ee534b8-ad7c-4718-a6a7-f595a4f788f7"
 
 
 [vars]
