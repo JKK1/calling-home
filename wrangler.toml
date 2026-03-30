@@ -6,6 +6,7 @@ pages_build_output_dir = "public"
 # Create with: wrangler d1 create calling-home-db
 # Then replace the database_id value below
 [[d1_databases]]
+
 binding      = "DB"
 database_name = "calling-home-db"
 database_id  = "e60b50b5-2522-4190-a09c-cdf95b350052"
